@@ -1,11 +1,19 @@
 import argparse
 import heapq
+import time
 import xml.etree.ElementTree as ET
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 MODEL_NAME = "TildeAI/TildeOpen-30b"
 DEFAULT_XML = "tezaurs_2026_1_wordforms_tei.xml"
+
+
+def format_duration(seconds):
+    """Format elapsed seconds as HH:MM:SS.mmm."""
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{int(hours):02d}:{int(minutes):02d}:{seconds:06.3f}"
 
 
 def local_name(tag):
@@ -63,6 +71,8 @@ def scan_tezaurs(xml_path, query_lemma):
     query_entries = 0
     entries = 0
 
+    scan_start = time.perf_counter()
+
     print(f'Scanning: {xml_path}')
     print(f'Query lemma: "{query_lemma}"')
 
@@ -107,20 +117,29 @@ def scan_tezaurs(xml_path, query_lemma):
     print(f"Matching query entries: {query_entries}")
     print(f"Excluded query forms ({len(query_inflections)}): "
           + ", ".join(sorted(query_inflections)))
+    scan_elapsed = time.perf_counter() - scan_start
+    print(f"Scanning time: {format_duration(scan_elapsed)}")
     return nouns, query_inflections
 
 
 def load_model():
     print("\nLoading tokenizer...")
+    tokenizer_start = time.perf_counter()
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=False)
+    tokenizer_elapsed = time.perf_counter() - tokenizer_start
+    print(f"Tokenizer loaded in: {format_duration(tokenizer_elapsed)}")
+
     print("Loading model...")
+    model_start = time.perf_counter()
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
         torch_dtype=torch.bfloat16,
         device_map="auto"
     )
     model.eval()
-    print("Model loaded.")
+    model_elapsed = time.perf_counter() - model_start
+    print(f"Model loaded in: {format_duration(model_elapsed)}")
+    print(f"Tokenizer + model load time: {format_duration(tokenizer_elapsed + model_elapsed)}")
     return tokenizer, model
 
 
@@ -145,6 +164,7 @@ def closest_synonyms_from_list(word, candidate_words, excluded_words,
     'Synonym' here means embedding-nearest noun; it is not a lexical
     synonym guarantee.
     """
+    processing_start = time.perf_counter()
     query_vector, query_ids = get_word_vector(word, tokenizer, model)
     excluded = set(excluded_words) | {word}
     seen = set()
@@ -175,7 +195,17 @@ def closest_synonyms_from_list(word, candidate_words, excluded_words,
             heapq.heapreplace(best, item)
 
         if i % 5000 == 0 or i == total:
-            print(f"Processed {i:,}/{total:,} (compared {compared:,}, skipped {skipped:,})")
+            elapsed = time.perf_counter() - processing_start
+            rate = compared / elapsed if elapsed > 0 else 0.0
+            remaining = total - i
+            eta = remaining / rate if rate > 0 else 0.0
+            print(
+                f"Processed {i:,}/{total:,} "
+                f"(compared {compared:,}, skipped {skipped:,}) | "
+                f"elapsed {format_duration(elapsed)} | "
+                f"{rate:.1f} words/s | "
+                f"ETA {format_duration(eta)}"
+            )
 
     results = [(w, -neg_d, cos, ids) for neg_d, w, cos, ids in best]
     results.sort(key=lambda x: x[1])
@@ -188,10 +218,19 @@ def closest_synonyms_from_list(word, candidate_words, excluded_words,
     for rank, (candidate, distance, cosine, ids) in enumerate(results, 1):
         print(f"{rank:2}. {candidate:<30} Euclidean: {distance:10.6f}   "
               f"Cosine: {cosine:9.6f}   Token IDs: {ids}")
+
+    processing_elapsed = time.perf_counter() - processing_start
+    print(f"\nProcessing time: {format_duration(processing_elapsed)}")
+    if compared:
+        print(f"Average processing time per compared word: "
+              f"{processing_elapsed / compared * 1000:.3f} ms")
+        print(f"Average processing speed: {compared / processing_elapsed:.1f} words/s")
     return results
 
 
 def main():
+    total_start = time.perf_counter()
+
     parser = argparse.ArgumentParser(
         description="Search Tēzaurs nominative-singular nouns by TildeOpen word-level embedding."
     )
@@ -213,10 +252,11 @@ def main():
         args.word, candidates, excluded, tokenizer, model, args.top_k
     )
 
+    total_elapsed = time.perf_counter() - total_start
+    print("\n" + "=" * 105)
+    print(f"TOTAL EXECUTION TIME: {format_duration(total_elapsed)}")
+    print("=" * 105)
+
 
 if __name__ == "__main__":
     main()
-
-# python closest_synonyms_tezaurs.py "māja" --xml "C:\QuizBuilder\tezaurs_2026_1_wordforms_tei.xml"
-
-# python closest_synonyms_tezaurs.py "māja" --top-k 20
